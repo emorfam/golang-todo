@@ -41,9 +41,10 @@ import (
 
 // Build-time variables (set via -ldflags).
 var (
-	version   = "dev"
-	commit    = "none"
-	buildTime = "unknown"
+	version     = "dev"
+	commit      = "none"
+	buildTime   = "unknown"
+	serviceName = "todo-api"
 )
 
 func main() {
@@ -60,21 +61,13 @@ func run() error {
 	}
 
 	// Initialize structured logger.
-	var handler slog.Handler
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	if cfg.LogFormat == "json" {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
-	} else {
-		handler = slog.NewTextHandler(os.Stdout, opts)
-	}
-	baseLogger := slog.New(handler)
-	slog.SetDefault(baseLogger)
+	initLogger(cfg)
 
 	// Register Prometheus metrics.
-	if err := metrics.Register(prometheus.DefaultRegisterer); err != nil {
-		return fmt.Errorf("registering metrics: %w", err)
+	err = initPrometheus(version, commit, buildTime)
+	if err != nil {
+		return fmt.Errorf("setting up prometheus: %w", err)
 	}
-	metrics.BuildInfo.WithLabelValues(version, commit, buildTime).Set(1)
 
 	// Open database and run migrations.
 	database, err := db.Open(cfg.DBDriver, cfg.DatabaseURL)
@@ -84,9 +77,9 @@ func run() error {
 	defer database.Close()
 
 	// Initialize OTel tracer.
-	tp, err := initTracer(cfg.OTLPEndpoint)
+	tp, err := initTracer(cfg.OTLPEndpoint, serviceName)
 	if err != nil {
-		baseLogger.Warn("tracing unavailable", "error", err)
+		slog.Warn("tracing unavailable", "error", err)
 	} else {
 		otel.SetTracerProvider(tp)
 		defer func() {
@@ -96,11 +89,17 @@ func run() error {
 		}()
 	}
 
-	// Load JWT public key (optional; if missing, /v1 routes return 401).
-	publicKey, err := loadPublicKey(cfg.JWTPublicKeyPath)
-	if err != nil {
-		baseLogger.Warn("JWT public key not loaded; /v1 routes will reject all requests", "error", err)
+	// Load JWT public key
+	var publicKey *ecdsa.PublicKey
+	if cfg.JWTPublicKeyPath != "" {
+		publicKey, err = loadPublicKey(cfg.JWTPublicKeyPath)
+		if err != nil {
+			return fmt.Errorf("loading JWT public key: %w", err)
+		}
+	} else {
+		return fmt.Errorf("JWT_PUBLIC_KEY_PATH is required")
 	}
+	slog.Info("JWT public key loaded successfully")
 
 	// Wire layers.
 	todoRepo := repository.NewTodoRepository(database, cfg.DBDriver)
@@ -116,11 +115,11 @@ func run() error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	baseLogger.Info("starting server", "addr", srv.Addr, "env", cfg.Env)
+	slog.Info("starting server", "addr", srv.Addr, "env", cfg.Env)
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			baseLogger.Error("listen error", "error", err)
+			slog.Error("listen error", "error", err)
 		}
 	}()
 
@@ -128,27 +127,46 @@ func run() error {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	baseLogger.Info("shutting down server")
+	slog.Info("shutting down server")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
-	baseLogger.Info("server stopped")
+	slog.Info("server stopped")
 	return nil
 }
 
-func initTracer(endpoint string) (*sdktrace.TracerProvider, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func initLogger(cfg *config.Config) {
+	var handler slog.Handler
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	if cfg.LogFormat == "json" {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+}
 
+func initPrometheus(version, commit, buildTime string) error {
+	if err := metrics.Register(prometheus.DefaultRegisterer); err != nil {
+		return fmt.Errorf("registering metrics: %w", err)
+	}
+	metrics.BuildInfo.WithLabelValues(version, commit, buildTime).Set(1)
+	return nil
+}
+
+func initTracer(endpoint, svcName string) (*sdktrace.TracerProvider, error) {
 	// The gRPC exporter expects a bare host:port target, not a URL with a scheme.
 	// Strip http:// or https:// if present so that values like
 	// "http://localhost:4317" (common in .env files) work correctly.
 	endpoint = strings.TrimPrefix(endpoint, "https://")
 	endpoint = strings.TrimPrefix(endpoint, "http://")
 
-	exp, err := otlptracegrpc.New(ctx,
+	expCtx, expCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer expCancel()
+	exp, err := otlptracegrpc.New(expCtx,
 		otlptracegrpc.WithEndpoint(endpoint),
 		otlptracegrpc.WithInsecure(),
 	)
@@ -156,8 +174,10 @@ func initTracer(endpoint string) (*sdktrace.TracerProvider, error) {
 		return nil, fmt.Errorf("creating OTLP exporter: %w", err)
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(semconv.ServiceName("todo-api")),
+	resCtx, resCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer resCancel()
+	res, err := resource.New(resCtx,
+		resource.WithAttributes(semconv.ServiceName(svcName)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating resource: %w", err)
